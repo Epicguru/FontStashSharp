@@ -14,10 +14,46 @@ using Vector2 = System.Drawing.PointF;
 
 namespace FontStashSharp
 {
+    public struct RichTextState
+    {
+        public static readonly RichTextState Default = new RichTextState();
+
+        public bool Bold;
+        public bool Italic;
+        public bool HasColor;
+		public Color Color;
+
+        public Color MakeColor(Color inputColor)
+        {
+            if (!HasColor)
+                return inputColor;
+
+            (float x, float y, float z, float w) = inputColor.ToVector4();
+            (float f, float f1, float z1, float w1) = this.Color.ToVector4();
+
+            var c = new Vector4(x * f, y * f1, z * z1, w * w1);
+            return new Color(c);
+        }
+
+        public void SetColor(Color color)
+        {
+			this.HasColor = true;
+			this.Color = color;
+        }
+
+        public void ClearColor()
+        {
+			this.HasColor = false;
+        }
+    }
+
 	public class DynamicSpriteFont
 	{
 		internal static readonly Vector2 DefaultScale = new Vector2(1.0f, 1.0f);
 		private readonly Int32Map<FontGlyph> _glyphs = new Int32Map<FontGlyph>();
+		private readonly Int32Map<FontGlyph> _boldGlyphs = new Int32Map<FontGlyph>();
+		private readonly Int32Map<FontGlyph> _italicGlyphs = new Int32Map<FontGlyph>();
+		private readonly Int32Map<FontGlyph> _boldItalicGlyphs = new Int32Map<FontGlyph>();
 
 		public FontSystem FontSystem { get; private set; }
 
@@ -34,16 +70,21 @@ namespace FontStashSharp
 			FontSize = size;
 		}
 
-		private FontGlyph GetGlyphWithoutBitmap(int codepoint)
-		{
+		private FontGlyph GetGlyphWithoutBitmap(int codepoint, RichTextState rtState)
+        {
+            bool b = rtState.Bold;
+            bool i = rtState.Italic;
+			bool c = b && i;
+			Int32Map<FontGlyph> mainGlyphs = c ? _boldItalicGlyphs : i ? _italicGlyphs : b ? _boldGlyphs : _glyphs;
+
 			FontGlyph glyph = null;
-			if (_glyphs.TryGetValue(codepoint, out glyph))
+			if (mainGlyphs.TryGetValue(codepoint, out glyph))
 			{
 				return glyph;
 			}
 
-			IFontSource font;
-			var g = FontSystem.GetCodepointIndex(codepoint, out font);
+            IFontSource font;
+			var g = FontSystem.GetCodepointIndex(codepoint, rtState, out font);
 			if (g == null)
 			{
 				return null;
@@ -69,14 +110,14 @@ namespace FontStashSharp
 				YOffset = y0 - offset
 			};
 
-			_glyphs[codepoint] = glyph;
+            mainGlyphs[codepoint] = glyph;
 
 			return glyph;
 		}
 
-		private FontGlyph GetGlyphInternal(int codepoint, bool withoutBitmap)
+		private FontGlyph GetGlyphInternal(int codepoint, bool withoutBitmap, RichTextState rtState)
 		{
-			var glyph = GetGlyphWithoutBitmap(codepoint);
+			var glyph = GetGlyphWithoutBitmap(codepoint, rtState);
 			if (glyph == null)
 			{
 				return null;
@@ -90,12 +131,12 @@ namespace FontStashSharp
 			return glyph;
 		}
 
-		FontGlyph GetGlyph(int codepoint, bool withoutBitmap)
-		{
-			var result = GetGlyphInternal(codepoint, withoutBitmap);
+		FontGlyph GetGlyph(int codepoint, bool withoutBitmap, RichTextState rtState)
+        {
+            var result = GetGlyphInternal(codepoint, withoutBitmap, rtState);
 			if (result == null && FontSystem.DefaultCharacter != null)
 			{
-				result = GetGlyphInternal(FontSystem.DefaultCharacter.Value, withoutBitmap);
+				result = GetGlyphInternal(FontSystem.DefaultCharacter.Value, withoutBitmap, rtState);
 			}
 
 			return result;
@@ -106,11 +147,20 @@ namespace FontStashSharp
 			// Determine ascent and lineHeight from first character
 			ascent = 0;
 			lineHeight = 0;
+
+            var q = new FontGlyphSquad();
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
+
 			for (int i = 0; i < str.Length; i += char.IsSurrogatePair(str, i) ? 2 : 1)
 			{
 				var codepoint = char.ConvertToUtf32(str, i);
-
-				var glyph = GetGlyph(codepoint, true);
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
+				var glyph = GetGlyph(codepoint, true, rts);
 				if (glyph == null)
 				{
 					continue;
@@ -122,6 +172,186 @@ namespace FontStashSharp
 				break;
 			}
 		}
+
+        private Color HexToColor(string str, Color defaultValue)
+        {
+			// In the format #RRGGBB(AA) where the AA is optional.
+            if (str.Length != 7 && str.Length != 9)
+                return defaultValue;
+
+            str = str.ToUpper();
+            Color color = new Color();
+
+            for (int i = 0; i < (str.Length == 9 ? 4 : 3); i++)
+            {
+                char a = str[i * 2 + 1];
+                char b = str[i * 2 + 2];
+
+                int intA;
+                int intB;
+
+                if (a >= '0' && a <= '9')
+                    intA = a - '0';
+				else if (a >= 'A' && a <= 'F')
+                    intA = 10 + (a - 'A');
+                else
+                    return defaultValue;
+
+                if (b >= '0' && b <= '9')
+                    intB = b - '0';
+                else if (b >= 'A' && b <= 'F')
+                    intB = 10 + (b - 'A');
+                else
+                    return defaultValue;
+
+                int val = intB + intA * 16;
+                if (val < 0 || val > 255)
+                    return defaultValue;
+
+				switch (i)
+                {
+                    case 0:
+                        color.R = (byte)val;
+                        break;
+                    case 1:
+                        color.G = (byte)val;
+                        break;
+                    case 2:
+                        color.B = (byte)val;
+                        break;
+                    default:
+                        color.A = (byte)val;
+                        break;
+                }
+            }
+
+			return color;
+        }
+
+        private bool EvaluateTag(string str, ref int index, ref RichTextState state)
+        {
+			// Assumes that str[index] is '<'.
+			if (index + 1 >= str.Length)
+				return false;
+
+            char typeChar = str[index + 1];
+            switch (typeChar)
+            {
+                // Ending something...
+				case '/':
+                    if (index + 2 >= str.Length)
+                        return false;
+                    switch (str[index + 2])
+                    {
+						case 'B' or 'b':
+							state.Bold = false;
+                            index += 3;
+							return true;
+                        case 'I' or 'i':
+                            state.Italic = false;
+                            index += 3;
+                            return true;
+                        case 'C' or 'c':
+							state.ClearColor();
+                            index += 3;
+                            return true;
+					}
+					return false;
+
+				// Starting bold.
+				case 'B' or 'b':
+                    if (index + 2 >= str.Length)
+                        return false;
+					if (str[index + 2] != '>')
+						return false;
+                    index += 2; // Skip these 3 characters <b>
+					state.Bold = true;
+					return true;
+
+                // Starting italic.
+                case 'I' or 'i':
+                    if (index + 2 >= str.Length)
+                        return false;
+                    if (str[index + 2] != '>')
+                        return false;
+                    index += 2; // Skip these 3 characters <b>
+                    state.Italic = true;
+                    return true;
+
+                // Starting color.
+                case 'C' or 'c':
+					// Find the end tag index.
+					int i = index + 3;
+                    if (index + 2 >= str.Length) // +1 is 'c', +2 should be '='
+                        return false;
+                    if (str[index + 2] != '=')
+                        return false;
+
+					bool valid = false;
+					while (i < str.Length)
+                    {
+                        char c = str[i];
+                        if (c == '>')
+                        {
+							valid = true;
+							break;
+                        }
+                        i++;
+                    }
+					if (!valid)
+						return false;
+                    string subStr = str.Substring(index + 3, i - index - 3);
+                    if (subStr.Length == 0)
+						return false;
+
+                    if (subStr[0] == '#')
+                    {
+						// It's a hex color.
+                        Color fromHex = HexToColor(subStr, Color.White);
+                        state.SetColor(fromHex);
+                        index += i - index;
+                        return true;
+					}
+                    else
+                    {
+                        switch (subStr)
+                        {
+							case "red":
+                                state.SetColor(Color.Red);
+                                index += i - index;
+                                return true;
+                            case "yellow":
+                                state.SetColor(Color.Yellow);
+                                index += i - index;
+                                return true;
+                            case "blue":
+                                state.SetColor(Color.Blue);
+                                index += i - index;
+                                return true;
+                            case "green":
+                                state.SetColor(Color.Green);
+                                index += i - index;
+                                return true;
+                            case "cyan":
+                                state.SetColor(Color.Cyan);
+                                index += i - index;
+                                return true;
+                            case "orange":
+                                state.SetColor(Color.Orange);
+                                index += i - index;
+                                return true;
+							default:
+								return false;
+						}
+                    }
+            }
+			return false;
+        }
+
+        private bool EvaluateTag(StringBuilder str, ref int index, ref RichTextState state)
+        {
+			return false;
+        }
 
 		public float DrawText(IFontStashRenderer batch, float x, float y, string str, Color color, Vector2 scale, float depth = 0.0f)
 		{
@@ -136,10 +366,13 @@ namespace FontStashSharp
 			originY += ascent;
 
 			FontGlyph prevGlyph = null;
+
 			var q = new FontGlyphSquad();
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 			for (int i = 0; i < str.Length; i += char.IsSurrogatePair(str, i) ? 2 : 1)
 			{
-				var codepoint = char.ConvertToUtf32(str, i);
+                var codepoint = char.ConvertToUtf32(str, i);
 				if (codepoint == '\n')
 				{
 					originX = 0.0f;
@@ -147,8 +380,13 @@ namespace FontStashSharp
 					prevGlyph = null;
 					continue;
 				}
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
 
-				var glyph = GetGlyph(codepoint, false);
+				var glyph = GetGlyph(codepoint, false, rts);
 				if (glyph == null)
 				{
 					continue;
@@ -163,7 +401,7 @@ namespace FontStashSharp
 					batch.Draw(glyph.Atlas.Texture,
 						destRect,
 						sourceRect,
-						color,
+						rts.MakeColor(color),
 						depth);
 				}
 
@@ -173,6 +411,7 @@ namespace FontStashSharp
 			return x;
 		}
 
+		// STUB
 		public float DrawText(IFontStashRenderer batch, float x, float y, string str, Color color, float depth = 0.0f)
 		{
 			return DrawText(batch, x, y, str, color, DefaultScale, depth);
@@ -190,9 +429,11 @@ namespace FontStashSharp
 
 			originY += ascent;
 
-			FontGlyph prevGlyph = null;
+            FontGlyph prevGlyph = null;
 			var pos = 0;
-			var q = new FontGlyphSquad();
+            var q = new FontGlyphSquad();
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 			for (int i = 0; i < str.Length; i += char.IsSurrogatePair(str, i) ? 2 : 1)
 			{
 				var codepoint = char.ConvertToUtf32(str, i);
@@ -205,8 +446,13 @@ namespace FontStashSharp
 					++pos;
 					continue;
 				}
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
 
-				var glyph = GetGlyph(codepoint, false);
+				var glyph = GetGlyph(codepoint, false, rts);
 				if (glyph == null)
 				{
 					++pos;
@@ -233,6 +479,7 @@ namespace FontStashSharp
 			return x;
 		}
 
+		// STUB
 		public float DrawText(IFontStashRenderer batch, float x, float y, string str, Color[] colors, float depth = 0.0f)
 		{
 			return DrawText(batch, x, y, str, colors, DefaultScale, depth);
@@ -243,11 +490,18 @@ namespace FontStashSharp
 			// Determine ascent and lineHeight from first character
 			ascent = 0;
 			lineHeight = 0;
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 			for (int i = 0; i < str.Length; i += StringBuilderIsSurrogatePair(str, i) ? 2 : 1)
 			{
 				var codepoint = StringBuilderConvertToUtf32(str, i);
 
-				var glyph = GetGlyph(codepoint, true);
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
+				var glyph = GetGlyph(codepoint, true, rts);
 				if (glyph == null)
 				{
 					continue;
@@ -274,6 +528,8 @@ namespace FontStashSharp
 
 			FontGlyph prevGlyph = null;
 			var q = new FontGlyphSquad();
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 			for (int i = 0; i < str.Length; i += StringBuilderIsSurrogatePair(str, i) ? 2 : 1)
 			{
 				var codepoint = StringBuilderConvertToUtf32(str, i);
@@ -285,8 +541,13 @@ namespace FontStashSharp
 					prevGlyph = null;
 					continue;
 				}
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
 
-				var glyph = GetGlyph(codepoint, false);
+				var glyph = GetGlyph(codepoint, false, rts);
 				if (glyph == null)
 				{
 					continue;
@@ -311,6 +572,7 @@ namespace FontStashSharp
 			return x;
 		}
 
+		// STUB
 		public float DrawText(IFontStashRenderer batch, float x, float y, StringBuilder str, Color color, float depth = 0.0f)
 		{
 			return DrawText(batch, x, y, str, color, DefaultScale, depth);
@@ -331,6 +593,8 @@ namespace FontStashSharp
 			FontGlyph prevGlyph = null;
 			var pos = 0;
 			var q = new FontGlyphSquad();
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 			for (int i = 0; i < str.Length; i += StringBuilderIsSurrogatePair(str, i) ? 2 : 1)
 			{
 				var codepoint = StringBuilderConvertToUtf32(str, i);
@@ -343,8 +607,13 @@ namespace FontStashSharp
 					++pos;
 					continue;
 				}
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
 
-				var glyph = GetGlyph(codepoint, false);
+				var glyph = GetGlyph(codepoint, false, rts);
 				if (glyph == null)
 				{
 					++pos;
@@ -371,6 +640,7 @@ namespace FontStashSharp
 			return x;
 		}
 
+		// STUB
 		public float DrawText(IFontStashRenderer batch, float x, float y, StringBuilder str, Color[] colors, float depth = 0.0f)
 		{
 			return DrawText(batch, x, y, str, colors, DefaultScale, depth);
@@ -392,6 +662,8 @@ namespace FontStashSharp
 			float startx = x;
 
 			FontGlyph prevGlyph = null;
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 
 			for (int i = 0; i < str.Length; i += char.IsSurrogatePair(str, i) ? 2 : 1)
 			{
@@ -403,8 +675,13 @@ namespace FontStashSharp
 					prevGlyph = null;
 					continue;
 				}
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
 
-				var glyph = GetGlyph(codepoint, true);
+				var glyph = GetGlyph(codepoint, true, rts);
 				if (glyph == null)
 				{
 					continue;
@@ -455,6 +732,8 @@ namespace FontStashSharp
 			float startx = x;
 
 			FontGlyph prevGlyph = null;
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 
 			for (int i = 0; i < str.Length; i += StringBuilderIsSurrogatePair(str, i) ? 2 : 1)
 			{
@@ -467,8 +746,13 @@ namespace FontStashSharp
 					prevGlyph = null;
 					continue;
 				}
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
 
-				var glyph = GetGlyph(codepoint, true);
+				var glyph = GetGlyph(codepoint, true, rts);
 				if (glyph == null)
 				{
 					continue;
@@ -515,6 +799,8 @@ namespace FontStashSharp
 			y += ascent;
 
 			float startx = x;
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 
 			FontGlyph prevGlyph = null;
 			for (int i = 0; i < str.Length; i += char.IsSurrogatePair(str, i) ? 2 : 1)
@@ -528,8 +814,13 @@ namespace FontStashSharp
 					prevGlyph = null;
 					continue;
 				}
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
 
-				var glyph = GetGlyph(codepoint, true);
+				var glyph = GetGlyph(codepoint, true, rts);
 				if (glyph == null)
 				{
 					continue;
@@ -566,6 +857,8 @@ namespace FontStashSharp
 			float startx = x;
 
 			FontGlyph prevGlyph = null;
+            bool doRt = FontSystem.EnableRichText;
+            RichTextState rts = new RichTextState();
 
 			for (int i = 0; i < str.Length; i += StringBuilderIsSurrogatePair(str, i) ? 2 : 1)
 			{
@@ -578,8 +871,13 @@ namespace FontStashSharp
 					prevGlyph = null;
 					continue;
 				}
+                if (doRt && codepoint == '<')
+                {
+                    if (EvaluateTag(str, ref i, ref rts))
+                        continue;
+                }
 
-				var glyph = GetGlyph(codepoint, true);
+				var glyph = GetGlyph(codepoint, true, rts);
 				if (glyph == null)
 				{
 					continue;
